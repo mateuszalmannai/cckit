@@ -1,0 +1,14 @@
+# Go build output
+/ctxscope/ctxscope
+*.test
+*.out
+
+# Python
+__pycache__/
+*.pyc
+
+# ctxscope snapshots hold a full prompt context; never commit one
+snapshots/
+*.snapshot.json
+
+.DS_Store
