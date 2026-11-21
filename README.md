@@ -35,6 +35,24 @@ The `memory-tree` skill in `skills/memory-tree` tells Claude to write memories i
 
 Both hooks always exit 0, so a memory problem never blocks a session. `memory status` prints one short line for a status line, such as `🧠 31 · 50/200 ✓`.
 
+## secret
+
+`bin/secret` is a bash script for macOS that keeps API tokens and passwords in the login Keychain instead of in `export` lines of your shell dotfiles, where every tool that reads your home folder, Claude Code included, can see them.
+
+- **Store and read:** `secret set <name>` asks for the value with a hidden prompt (or reads it from a pipe), `secret get <name>` prints it, `secret copy <name>` puts it on the clipboard.
+- **Look without revealing:** `secret check <name>...` shows whether an item exists, its length and its first five characters; `secret list` names the items `secret` has stored.
+- **Move existing dotfile secrets:** `secret import ~/.secrets.zsh` offers each `export VAR=value` line, stores the values, and prints lookup lines to replace them with; `--rewrite` replaces them in place, keeping the file's permissions.
+
+In a dotfile, a moved line reads the value when the shell starts:
+
+```sh
+export SOME_API_TOKEN="$(security find-generic-password -s some-api-token -w 2>/dev/null)"
+```
+
+`security -w` prints values that contain a backslash or a non-ASCII character as hex. `secret get` decodes them, and `secret import` warns when a value needs `$(secret get <name>)` instead of the generated line.
+
+Values reach `security` on stdin, never on the command line, so they do not show up in `ps` or your shell history. Set `SECRET_KEYCHAIN` to a keychain file to use that instead of the login Keychain; `tests/test_secret.sh` does this with a throwaway keychain.
+
 ## License
 
 MIT, see `LICENSE`.
