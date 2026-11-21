@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # macOS: secret needs the security tool and a keychain
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ctxscope/go.mod
+          cache-dependency-path: ctxscope/go.sum
+
+      - name: ctxscope
+        working-directory: ctxscope
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          go test ./...
+
+      - name: memory
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: secret
+        run: tests/test_secret.sh
+
+      - name: shellcheck
+        run: |
+          brew install shellcheck
+          shellcheck bin/secret install.sh tests/test_secret.sh .githooks/pre-commit
+
+      - name: install.sh
+        run: |
+          PREFIX="$RUNNER_TEMP/bin" SKILLS_DIR="$RUNNER_TEMP/skills" ./install.sh
+          go version -m "$RUNNER_TEMP/bin/ctxscope" | grep -q 'github.com/mateuszalmannai/cckit/ctxscope'
+          "$RUNNER_TEMP/bin/memory" -h >/dev/null

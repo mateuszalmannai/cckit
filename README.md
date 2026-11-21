@@ -8,7 +8,22 @@ Small tools for people who run a heavily customised Claude Code on macOS: see wh
 | `memory` | Keeps Claude Code's memory folder as a tree of one-fact files, rebuilds and checks the `MEMORY.md` index, moves memories without breaking `[[links]]` |
 | `secret` | Stores secrets in the macOS login Keychain instead of shell dotfiles, and moves existing `export` lines into it |
 
-Work in progress: the tools are being moved into this repository. Install steps follow with `install.sh`.
+## Install
+
+Requirements: macOS (for `secret`), Go 1.23 or newer (for `ctxscope`), Python 3.9 or newer (for `memory`), and optionally `fzf` for `memory ls`.
+
+```sh
+git clone https://github.com/mateuszalmannai/cckit.git ~/scripts/cckit
+~/scripts/cckit/install.sh
+```
+
+`install.sh` builds `ctxscope` and links `memory` and `secret` into `~/.local/bin` (set `PREFIX` for another folder), and links the `memory-tree` skill into `~/.claude/skills` (`SKILLS_DIR`; `--no-skill` leaves it out). It never overwrites anything that is not its own unless you pass `--force`, which keeps a `.bak` copy, and it never edits `settings.json`: it prints the hook snippet for you to add. Run it again after `git pull`; the links pick up changes to `memory` and `secret` at once, and `ctxscope` is rebuilt.
+
+To install only `ctxscope`: `go install github.com/mateuszalmannai/cckit/ctxscope@latest`.
+
+## ctxscope
+
+`ctxscope capture` runs Claude Code once through a local logging proxy and saves what it sent as a snapshot; `ctxscope proxy` does the same for an interactive session. `ctxscope report` lists every token by category, source or chunk, `ctxscope diff` compares two snapshots, so you can measure what a config change saved, and `ctxscope tui` browses a snapshot as a treemap. Snapshots hold your full starting context, so they live in `~/.local/share/ctxscope/snapshots`, outside any repository. Details and the attribution rules are in [`ctxscope/README.md`](ctxscope/README.md).
 
 ## memory
 
@@ -52,6 +67,10 @@ export SOME_API_TOKEN="$(security find-generic-password -s some-api-token -w 2>/
 `security -w` prints values that contain a backslash or a non-ASCII character as hex. `secret get` decodes them, and `secret import` warns when a value needs `$(secret get <name>)` instead of the generated line.
 
 Values reach `security` on stdin, never on the command line, so they do not show up in `ps` or your shell history. Set `SECRET_KEYCHAIN` to a keychain file to use that instead of the login Keychain; `tests/test_secret.sh` does this with a throwaway keychain.
+
+## Contributing
+
+Run the checks that CI runs: `go vet ./...` and `go test ./...` in `ctxscope/`, `python3 -m unittest discover -s tests -p 'test_*.py'`, `tests/test_secret.sh` (it uses a throwaway keychain), and `shellcheck` on the shell scripts. The pre-commit hook in `.githooks` runs gitleaks and refuses commits whose author email is not a GitHub noreply address; enable it with `git config core.hooksPath .githooks`.
 
 ## License
 
