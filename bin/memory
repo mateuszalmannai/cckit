@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+"""memory — view, edit and check Claude Code's memory folder, and generate its MEMORY.md index.
+
+  memory ls [query] [--plain]   list memories; in a terminal with fzf: pick one, Enter edits it
+  memory show <name>            print a memory
+  memory path <name>            print its file path
+  memory edit <name>            open in $EDITOR, then check it and rebuild the index
+  memory new <type>[/<leaf>...]/<slug>   create from a template, edit, rebuild the index
+  memory new <slug> --type <type>        the same in a flat tree (files directly in the root)
+  memory rm <name>              delete (asks first, names inbound links), rebuild the index
+  memory mv <name> <type>[/<folder>] [--name NEW]   move/rename, rewrite [[links]], rebuild the index
+  memory migrate --plan > plan.tsv                  flat layout → tree: a plan to edit (type, folder, name)
+  memory migrate --apply plan.tsv [--dry-run]       check the whole plan, then move, rename, relink, reindex
+  memory index [--dry-run]      rebuild MEMORY.md from the files' frontmatter
+  memory check                  report broken frontmatter, duplicate names, stale or oversized index
+  memory status [--color]       one line for a status line: 🧠 31 · 50/200 ✓ (⚠ near a limit, ✗ errors)
+  memory hook post-tool-use|session-start   Claude Code hooks (read the event JSON on stdin)
+
+<name> is a memory's `name` slug, a unique part of it, or a path inside the tree.
+The tree is $MEMORY_ROOT, else ~/.claude/memory; --root DIR overrides both.
+
+Works on the tree layout (user/ feedback/ project/ reference/ folders) and on Claude Code's
+built-in flat layout (files directly in the root), or a mix. Index titles and hooks come from
+`metadata.title` and `metadata.hook`, else from the file's current MEMORY.md line, else the
+name in sentence case and the description.
+"""
+import argparse
+import difflib
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+TYPES = ["user", "feedback", "project", "reference"]
+LISTED = {"user", "feedback"}            # one index line per memory; the others: one line per leaf
+INDEX = "MEMORY.md"
+DEFAULT_HEADER = "# Memory index\n"
+INDEX_WARN_LINES, INDEX_MAX_LINES = 150, 200   # Claude Code loads the first 200 lines ...
+INDEX_WARN_BYTES, INDEX_MAX_BYTES = 20_000, 25_000   # ... or 25 KB of MEMORY.md, whichever comes first
+LINK_RE = re.compile(r"\[\[([A-Za-z0-9][\w-]*)(?:\|[^\]]*)?\]\]")
+CODE_RE = re.compile(r"```.*?```|`[^`\n]*`", re.S)   # links inside code are not links
+
+
+# --- frontmatter ----------------------------------------------------------------------
+
+def _unquote(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith('"'):
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return raw.strip('"')
+    if raw.startswith("'") and raw.endswith("'") and len(raw) > 1:
+        return raw[1:-1].replace("''", "'")
+    return raw
+
+
+def _quote(value: str) -> str:
+    plain = re.fullmatch(r"[A-Za-z0-9À-ž(][^\n]*", value or "") and ": " not in value \
+        and " #" not in value and not value.endswith(":")
+    return value if plain else json.dumps(value, ensure_ascii=False)
+
+
+def split_frontmatter(text: str):
+    """(frontmatter lines, body) or (None, text) when the file has no frontmatter."""
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None, text
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return lines[1:i], "\n".join(lines[i + 1:])
+    return None, text
+
+
+def parse_frontmatter(fm_lines):
+    top, meta, in_meta = {}, {}, False
+    for line in fm_lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indented = line[0] in " \t"
+        key, sep, value = line.strip().partition(":")
+        if not sep:
+            continue
+        if not indented:
+            in_meta = key == "metadata" and not value.strip()
+            if not in_meta:
+                top[key] = _unquote(value)
+        elif in_meta:
+            meta[key] = _unquote(value)
+    return top, meta
+
+
+def set_metadata(path: Path, key: str, value: str):
+    """Set metadata.<key> in place; every other line stays as it is."""
+    text = path.read_text()
+    fm, body = split_frontmatter(text)
+    if fm is None:
+        raise SystemExit(f"{path}: no frontmatter")
+    out, start, done = [], None, False
+    for i, line in enumerate(fm):
+        if line.rstrip() == "metadata:" or (line.startswith("metadata:") and not line[9:].strip()):
+            start = i
+        elif start is not None and not done and line[:1] in (" ", "\t") \
+                and line.strip().partition(":")[0] == key:
+            out.append(f"  {key}: {_quote(value)}"); done = True; continue
+        out.append(line)
+    if not done:
+        if start is None:
+            out += ["metadata:", f"  {key}: {_quote(value)}"]
+        else:
+            end = start + 1
+            while end < len(out) and out[end][:1] in (" ", "\t"):
+                end += 1
+            out.insert(end, f"  {key}: {_quote(value)}")
+    path.write_text("---\n" + "\n".join(out) + "\n---\n" + body)
+
+
+# --- the tree -------------------------------------------------------------------------
+
+@dataclass
+class Memory:
+    path: Path                     # relative to the root
+    has_frontmatter: bool
+    top: dict = field(default_factory=dict)
+    meta: dict = field(default_factory=dict)
+    body: str = ""
+    indexed: tuple = ("", "")      # (title, hook) of this file's line in the current MEMORY.md
+
+    @property
+    def flat(self):
+        """A file directly in the root: the built-in flat layout, typed by its frontmatter only."""
+        return len(self.path.parts) == 1
+
+    @property
+    def folder_type(self):
+        return "" if self.flat else self.path.parts[0]
+
+    @property
+    def section(self):
+        if self.flat:
+            return self.mtype if self.mtype in TYPES else "other"
+        return self.folder_type
+
+    @property
+    def leaf(self):
+        return self.path.parent.as_posix()
+
+    @property
+    def name(self):
+        return self.top.get("name", "")
+
+    @property
+    def description(self):
+        return self.top.get("description", "")
+
+    @property
+    def mtype(self):
+        return self.meta.get("type") or self.top.get("type", "")
+
+    @property
+    def title(self):
+        return (self.meta.get("title") or self.top.get("title") or self.indexed[0]
+                or humanize(self.name or self.path.stem))
+
+    @property
+    def hook(self):
+        return self.meta.get("hook") or self.top.get("hook") or self.indexed[1] or self.description
+
+    @property
+    def links(self):
+        return sorted(set(LINK_RE.findall(CODE_RE.sub("", self.body))))
+
+
+def humanize(slug: str) -> str:
+    words = slug.replace("_", "-").split("-")
+    return " ".join(words)[:1].upper() + " ".join(words)[1:]
+
+
+def root_dir(arg=None) -> Path:
+    return Path(arg or os.environ.get("MEMORY_ROOT") or Path.home() / ".claude" / "memory").expanduser()
+
+
+INDEX_LINE_RE = re.compile(r"^- \[(.+?)\]\((.+?)\)(?:\s+(?:—|–|-|:)\s+(.*))?$", re.M)
+
+
+def indexed_lines(root: Path) -> dict:
+    """path -> (title, hook) from the current MEMORY.md, so a hand-written title survives a rebuild."""
+    path = root / INDEX
+    if not path.exists():
+        return {}
+    return {p: (t, h or "") for t, p, h in INDEX_LINE_RE.findall(path.read_text())}
+
+
+def load(root: Path) -> list:
+    memories, indexed = [], indexed_lines(root)
+    for p in sorted(root.rglob("*.md")):
+        rel = p.relative_to(root)
+        if rel.as_posix() == INDEX or any(part.startswith(".") for part in rel.parts):
+            continue
+        fm, body = split_frontmatter(p.read_text())
+        if fm is None:
+            memories.append(Memory(rel, False, body=body))
+        else:
+            top, meta = parse_frontmatter(fm)
+            memories.append(Memory(rel, True, top, meta, body, indexed.get(rel.as_posix(), ("", ""))))
+    return memories
+
+
+def resolve(root: Path, memories: list, query: str) -> Memory:
+    for m in memories:
+        if query in (m.name, m.path.as_posix(), m.path.with_suffix("").as_posix()):
+            return m
+    hits = [m for m in memories if query.lower() in (m.name or m.path.stem).lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise SystemExit(f"no memory matches '{query}'")
+    raise SystemExit(f"'{query}' matches {len(hits)} memories: " + ", ".join(m.name or str(m.path) for m in hits))
+
+
+# --- the index ------------------------------------------------------------------------
+
+def leaf_label(leaf: str, mtype: str) -> str:
+    return leaf[len(mtype) + 1:] if leaf != mtype else mtype
+
+
+def line(m) -> str:
+    return f"- [{m.title}]({m.path.as_posix()}) — {m.hook}"
+
+
+def render_index(memories: list, header: str) -> str:
+    sections = []
+    for mtype in TYPES + ["other"]:
+        mine = [m for m in memories if m.has_frontmatter and m.section == mtype]
+        if not mine:
+            continue
+        flat = sorted((m for m in mine if m.flat), key=lambda m: m.title.casefold())
+        blocks = ["\n".join(line(m) for m in flat)] if flat else []
+        leaves = {}
+        for m in mine:
+            if not m.flat:
+                leaves.setdefault(m.leaf, []).append(m)
+        for leaf in sorted(leaves, key=lambda l: (l != mtype, l.casefold())):
+            group = sorted(leaves[leaf], key=lambda m: m.title.casefold())
+            if mtype in LISTED:
+                lines = [line(m) for m in group]
+                head = [] if leaf == mtype else [f"### {leaf_label(leaf, mtype)} — `{leaf}/`"]
+                blocks.append("\n".join(head + lines))
+            else:
+                blocks.append(f"### {leaf_label(leaf, mtype)} — `{leaf}/` ({len(group)})\n"
+                              + " · ".join(m.title for m in group))
+        sections.append(f"## {mtype}\n" + "\n\n".join(blocks))
+    return header.rstrip("\n") + "\n\n" + "\n\n".join(sections) + "\n"
+
+
+def current_header(root: Path) -> str:
+    path = root / INDEX
+    if not path.exists():
+        return DEFAULT_HEADER
+    text = path.read_text()
+    match = re.search(r"^(## |- \[)", text, re.M)   # the header ends at the first section or entry
+    header = text[:match.start()] if match else text
+    return header if header.strip() else DEFAULT_HEADER
+
+
+def build_index(root: Path, memories: list):
+    """(new text, old text) for MEMORY.md."""
+    path = root / INDEX
+    old = path.read_text() if path.exists() else ""
+    return render_index(memories, current_header(root)), old
+
+
+def write_index(root: Path, memories: list, quiet=False, silent=False) -> bool:
+    new, old = build_index(root, memories)
+    if new == old:
+        if not (quiet or silent):
+            info(f"{INDEX} unchanged ({count(memories)} memories)")
+        return False
+    (root / INDEX).write_text(new)
+    if not silent:
+        ok(f"{INDEX} rebuilt ({count(memories)} memories, {new.count(chr(10))} lines)")
+    return True
+
+
+def count(memories):
+    return sum(1 for m in memories if m.has_frontmatter)
+
+
+# --- check ----------------------------------------------------------------------------
+
+def problems(root: Path, memories: list):
+    """(errors, warnings) as lists of strings."""
+    errors, warnings = [], []
+    names = {}
+    for m in memories:
+        p = m.path.as_posix()
+        if not m.has_frontmatter:
+            errors.append(f"{p}: no frontmatter"); continue
+        if not m.flat and m.folder_type not in TYPES:
+            errors.append(f"{p}: not under {'/'.join(TYPES)}/")
+        for key in ("name", "description"):
+            if not m.top.get(key):
+                errors.append(f"{p}: no `{key}`")
+        if not m.mtype:
+            errors.append(f"{p}: no `metadata.type`")
+        elif m.flat and m.mtype not in TYPES:
+            errors.append(f"{p}: type `{m.mtype}` is not one of {', '.join(TYPES)}")
+        elif m.folder_type in TYPES and m.mtype != m.folder_type:
+            errors.append(f"{p}: type `{m.mtype}` but stored under {m.folder_type}/")
+        if m.name and m.name != m.path.stem:
+            warnings.append(f"{p}: name `{m.name}` differs from the file name")
+        if not m.meta.get("title") and not m.top.get("title") and not m.indexed[0]:
+            warnings.append(f"{p}: no `metadata.title`, the index shows \"{m.title}\"")
+        if m.name:
+            names.setdefault(m.name, []).append(p)
+    for name, paths in names.items():
+        if len(paths) > 1:
+            errors.append(f"name `{name}` is used by {len(paths)} files: {', '.join(paths)}")
+    unwritten = sorted({(link, m.name) for m in memories for link in m.links if link not in names})
+    for link, source in unwritten:
+        warnings.append(f"[[{link}]] in `{source}` has no memory yet (a marker, fine if intended)")
+    new, old = build_index(root, memories)
+    if new != old:
+        errors.append(f"{INDEX} is out of date — run: memory index")
+    lines, size = new.count("\n"), len(new.encode())
+    if lines > INDEX_MAX_LINES:
+        errors.append(f"{INDEX} has {lines} lines; past {INDEX_MAX_LINES} the end is not loaded")
+    elif lines > INDEX_WARN_LINES:
+        warnings.append(f"{INDEX} has {lines} lines; nest or merge before it passes {INDEX_MAX_LINES}")
+    if size > INDEX_MAX_BYTES:
+        errors.append(f"{INDEX} is {size / 1000:.1f} KB; past {INDEX_MAX_BYTES // 1000} KB the end is not loaded")
+    elif size > INDEX_WARN_BYTES:
+        warnings.append(f"{INDEX} is {size / 1000:.1f} KB; shorten hooks or merge before it passes "
+                        f"{INDEX_MAX_BYTES // 1000} KB")
+    return errors, warnings
+
+
+# --- status line and hooks ------------------------------------------------------------
+
+def health(root: Path) -> dict:
+    memories = load(root)
+    errors, warnings = problems(root, memories)
+    new, _ = build_index(root, memories)
+    return {"count": count(memories), "lines": new.count("\n"), "bytes": len(new.encode()),
+            "errors": errors, "stale": any("out of date" in e for e in errors),
+            "near_limit": any(w.startswith(INDEX + " ") for w in warnings)}
+
+
+def status_text(h: dict, color: bool) -> str:
+    line_share, byte_share = h["lines"] / INDEX_MAX_LINES, h["bytes"] / INDEX_MAX_BYTES
+    usage = (f"{h['lines']}/{INDEX_MAX_LINES}" if line_share >= byte_share
+             else f"{h['bytes'] / 1000:.0f}/{INDEX_MAX_BYTES // 1000} KB")
+    over = line_share > 1 or byte_share > 1
+    if h["errors"]:
+        n = len(h["errors"])
+        what = (usage if over else "index stale" if h["stale"] and n == 1
+                else f"{n} error" + ("s" if n > 1 else ""))
+        text, code = f"🧠 {h['count']} · {what} ✗", 31
+    elif h["near_limit"]:
+        text, code = f"🧠 {h['count']} · {usage} ⚠", 33
+    else:
+        text, code = f"🧠 {h['count']} · {usage} ✓", 32
+    return f"\033[{code}m{text}\033[0m" if color else text
+
+
+def fingerprint(root: Path) -> str:
+    """Changes whenever a file in the tree (or this tool) changes; cheap enough for a status line."""
+    digest = hashlib.sha1(str(Path(__file__).stat().st_mtime_ns).encode())
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        for name in sorted(filenames):
+            if name.endswith(".md"):
+                st = os.stat(os.path.join(dirpath, name))
+                digest.update(f"{dirpath}/{name}:{st.st_mtime_ns}:{st.st_size}".encode())
+    return digest.hexdigest()
+
+
+def cmd_status(root, a):
+    try:
+        cache_dir = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "memory-status"
+        cache = cache_dir / (hashlib.sha1(str(root.resolve()).encode()).hexdigest()[:12] + ".json")
+        fp = fingerprint(root)
+        try:
+            cached = json.loads(cache.read_text())
+            if cached.get("fp") == fp:
+                print(status_text(cached["health"], a.color)); return 0
+        except (OSError, ValueError, KeyError):
+            pass
+        h = health(root)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"fp": fp, "health": h}))
+        print(status_text(h, a.color))
+    except Exception:  # a status line must never break
+        print("🧠 ?")
+    return 0
+
+
+def hook_output(event: str, context: str):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}}))
+
+
+def cmd_hook(root, a):
+    """Claude Code hooks; always exit 0 so a memory problem never blocks a session."""
+    try:
+        if a.event == "post-tool-use":
+            payload = json.loads(sys.stdin.read() or "{}")
+            target = (payload.get("tool_input") or {}).get("file_path") \
+                or (payload.get("tool_response") or {}).get("filePath")
+            if not target or not target.endswith(".md"):
+                return 0
+            target, base = Path(target).resolve(), root.resolve()
+            if base not in target.parents:
+                return 0
+            rebuilt = write_index(root, load(root), quiet=True, silent=True)
+            notes = []
+            if rebuilt and target == base / INDEX:
+                notes.append(f"{INDEX} is generated: `memory index` replaced the hand edit. Put a memory's title "
+                             "and hook in its frontmatter under `metadata` instead.")
+            elif rebuilt:
+                notes.append(f"`memory index` rebuilt {INDEX}; do not edit it by hand.")
+            errors, _ = problems(root, load(root))
+            if errors:
+                notes.append("`memory check` reports: " + "; ".join(errors[:5]) + ". Fix these.")
+            if notes:
+                hook_output("PostToolUse", " ".join(notes))
+        elif a.event == "session-start":
+            errors, warnings = problems(root, load(root))
+            size = [w for w in warnings if w.startswith(INDEX + " ")]
+            if errors or size:
+                hook_output("SessionStart", f"Memory folder {root}: `memory check` reports: "
+                            + "; ".join((errors + size)[:6])
+                            + ". Tell the user, and fix it when they agree (`memory index` rebuilds a stale index).")
+    except Exception as exc:  # never block the session over memory
+        print(f"memory hook {a.event}: {exc}", file=sys.stderr)
+    return 0
+
+
+# --- output ---------------------------------------------------------------------------
+
+COLOR = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
+def _c(code, s): return f"\033[{code}m{s}\033[0m" if COLOR else s
+def ok(msg): print(f"{_c(32, '✓')} {msg}", file=sys.stderr)
+def info(msg): print(f"{_c(2, '•')} {msg}", file=sys.stderr)
+def warn(msg): print(f"{_c(33, '•')} {msg}", file=sys.stderr)
+def err(msg): print(f"{_c(31, '✗')} {msg}", file=sys.stderr)
+
+
+def editor(path: Path):
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise SystemExit(f"no terminal for an editor: edit {path} directly, then run `memory index`")
+    cmd = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    subprocess.call([*cmd.split(), str(path)])
+
+
+def after_edit(root: Path, path: Path):
+    memories = load(root)
+    rel = path.relative_to(root)
+    errors, warnings = problems(root, memories)
+    mine = [e for e in errors + warnings if e.startswith(rel.as_posix() + ":")]
+    for e in mine:
+        (err if e in errors else warn)(e)
+    write_index(root, memories)
+
+
+# --- moving and renaming -------------------------------------------------------------
+# A move is (memory, type, folder, name): the file goes to <type>/<folder>/<name>.md, its
+# frontmatter `name` and `metadata.type` follow, and every [[old-name]] link is rewritten.
+
+SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+def slugify(name: str, mtype: str = "") -> str:
+    """feedback_Use_PNPM -> use-pnpm: drop a leading type prefix, kebab-case the rest."""
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    if mtype and slug.startswith(mtype + "-") and len(slug) > len(mtype) + 1:
+        slug = slug[len(mtype) + 1:]
+    return slug
+
+
+def set_top(path: Path, key: str, value: str):
+    """Replace a top-level frontmatter field in place."""
+    fm, body = split_frontmatter(path.read_text())
+    out = [f"{key}: {_quote(value)}" if line.split(":", 1)[0] == key and line[:1] not in (" ", "\t") else line
+           for line in fm]
+    path.write_text("---\n" + "\n".join(out) + "\n---\n" + body)
+
+
+def plan_moves(root: Path, memories: list, rows: list):
+    """rows: (source path or name, type, folder, name). Returns (moves, errors); moves only if no errors."""
+    errors, moves, targets = [], [], {}
+    by_path = {m.path.as_posix(): m for m in memories}
+    for n, (source, mtype, folder, name) in enumerate(rows, 1):
+        where = f"row {n} ({source})"
+        m = by_path.get(source) or next((x for x in memories if x.name == source and x.has_frontmatter), None)
+        if m is None:
+            errors.append(f"{where}: no such memory"); continue
+        if not m.has_frontmatter:
+            errors.append(f"{where}: no frontmatter, fix it first"); continue
+        folder = folder.strip().strip("/")
+        if mtype not in TYPES:
+            errors.append(f"{where}: type `{mtype}` is not one of {', '.join(TYPES)}")
+        if folder and any(part in ("", ".", "..") or part.startswith(".") or not SLUG_RE.fullmatch(part)
+                          for part in folder.split("/")):
+            errors.append(f"{where}: folder `{folder}` must be kebab-case names separated by /")
+        if not SLUG_RE.fullmatch(name):
+            errors.append(f"{where}: name `{name}` must be kebab-case (a-z, 0-9, -)")
+        target = Path(mtype, *(folder.split("/") if folder else []), name + ".md")
+        if target.as_posix() in targets:
+            errors.append(f"{where}: {target} is also the target of row {targets[target.as_posix()]}")
+        targets[target.as_posix()] = n
+        if (root / target).exists() and target != m.path:
+            errors.append(f"{where}: {target} exists")
+        moves.append((m, mtype, folder, name, target))
+    moved = {m.path for m, *_ in moves}
+    names = {}
+    for m in memories:
+        if m.has_frontmatter and m.path not in moved:
+            names.setdefault(m.name, []).append(m.path.as_posix())
+    for m, _, _, name, target in moves:
+        names.setdefault(name, []).append(target.as_posix())
+    for name, paths in names.items():
+        if len(paths) > 1 and any(name == mv[3] for mv in moves):
+            errors.append(f"name `{name}` would be used by {len(paths)} files: {', '.join(paths)}")
+    return ([] if errors else moves), errors
+
+
+def describe_move(m, mtype, name, target) -> str:
+    notes = []
+    if name != m.name:
+        notes.append(f"name {m.name} → {name}")
+    if mtype != m.mtype:
+        notes.append(f"type {m.mtype} → {mtype}")
+    return f"{m.path} → {target}" + (f"  ({', '.join(notes)})" if notes else "")
+
+
+def apply_moves(root: Path, moves: list, dry_run=False) -> int:
+    changed = [mv for mv in moves if mv[4] != mv[0].path or mv[3] != mv[0].name or mv[1] != mv[0].mtype]
+    for m, mtype, _, name, target in changed:
+        print(("would move " if dry_run else "") + describe_move(m, mtype, name, target))
+    renames = {m.name: name for m, _, _, name, _ in changed if name != m.name}
+    if dry_run:
+        users = sorted({o.path.as_posix() for o in load(root) for old in renames if old in o.links})
+        if users:
+            print(f"would rewrite [[links]] in: {', '.join(users)}")
+        return len(changed)
+    for m, mtype, _, name, target in changed:
+        src = root / m.path
+        # keep a hand-written index title/hook: it is keyed by path, which is about to change
+        if m.indexed[0] and not (m.meta.get("title") or m.top.get("title")):
+            set_metadata(src, "title", m.indexed[0])
+        if m.indexed[1] and not (m.meta.get("hook") or m.top.get("hook")) and m.indexed[1] != m.description:
+            set_metadata(src, "hook", m.indexed[1])
+        if name != m.name:
+            set_top(src, "name", name)
+        if mtype != m.mtype:
+            set_metadata(src, "type", mtype)
+        if target != m.path:
+            (root / target).parent.mkdir(parents=True, exist_ok=True)
+            src.rename(root / target)
+            prune_empty(root, src.parent)
+    if renames:
+        pattern = re.compile(r"\[\[(" + "|".join(map(re.escape, renames)) + r")(?=[\]|])")
+        for o in load(root):
+            path = root / o.path
+            text = path.read_text()
+            new = pattern.sub(lambda mt: "[[" + renames[mt.group(1)], text)
+            if new != text:
+                path.write_text(new)
+                info(f"links updated in {o.path}")
+    write_index(root, load(root))
+    return len(changed)
+
+
+def prune_empty(root: Path, folder: Path):
+    while folder != root and folder.exists() and not any(p for p in folder.iterdir() if p.name != ".DS_Store"):
+        for junk in folder.iterdir():
+            junk.unlink()
+        folder.rmdir(); folder = folder.parent
+
+
+PLAN_HEADER = """# memory migrate plan: one row per memory, tab-separated: path, type, folder, name
+# The file moves to <type>/<folder>/<name>.md. Edit type, folder and name; leave path alone.
+#   folder: the project or topic under the type, e.g. fritz-monitoring; empty = directly in the type folder
+#   name:   kebab-case and unique; [[links]] to the old name are rewritten
+# Delete a row to leave that memory where it is. Then: memory migrate --apply <this file> [--dry-run]
+"""
+
+
+def read_plan(text: str) -> list:
+    rows = []
+    for n, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        cells = raw.split("\t")
+        if len(cells) != 4:
+            raise SystemExit(f"plan line {n}: expected 4 tab-separated cells (path, type, folder, name), got {len(cells)}")
+        rows.append(tuple(c.strip() for c in cells))
+    return rows
+
+
+# --- commands -------------------------------------------------------------------------
+
+def cmd_ls(root, a):
+    memories = [m for m in load(root) if m.has_frontmatter]
+    if a.query:
+        q = a.query.lower()
+        memories = [m for m in memories
+                    if q in " ".join([m.name, m.title, m.description, m.path.as_posix()]).lower()]
+    rows = [(m.path.as_posix(), f"{m.leaf:<40} {m.title}  \033[2m— {m.description}\033[0m") for m in memories]
+    if not a.plain and sys.stdout.isatty() and sys.stdin.isatty() and shutil.which("fzf"):
+        preview = "bat --style=plain --color=always {1}" if shutil.which("bat") else "cat {1}"
+        feed = "\n".join(f"{p}\t{label}" for p, label in rows)
+        pick = subprocess.run(["fzf", "--ansi", "--delimiter=\t", "--with-nth=2..", "--preview", preview,
+                               "--preview-window=right,55%,wrap", "--prompt=memory> ",
+                               "--header=Enter: edit   Esc: quit", *(["--query", a.query] if a.query else [])],
+                              input=feed, text=True, capture_output=False, stdout=subprocess.PIPE, cwd=root)
+        chosen = pick.stdout.strip().split("\t")[0]
+        if chosen:
+            path = root / chosen
+            editor(path)
+            after_edit(root, path)
+        return 0
+    for m in memories:
+        print(f"{m.name:<36} {m.leaf:<40} {m.title}")
+    return 0
+
+
+def cmd_show(root, a):
+    m = resolve(root, load(root), a.name)
+    path = root / m.path
+    if sys.stdout.isatty() and shutil.which("bat"):
+        return subprocess.call(["bat", "--style=header,grid", str(path)])
+    sys.stdout.write(path.read_text())
+    return 0
+
+
+def cmd_path(root, a):
+    print(root / resolve(root, load(root), a.name).path)
+    return 0
+
+
+def cmd_edit(root, a):
+    path = root / resolve(root, load(root), a.name).path
+    editor(path)
+    after_edit(root, path)
+    return 0
+
+
+def cmd_new(root, a):
+    rel = Path(a.target if a.target.endswith(".md") else a.target + ".md")
+    if len(rel.parts) == 1:                      # flat layout: the type comes from --type
+        if a.type not in TYPES:
+            raise SystemExit(f"a flat memory needs --type {'|'.join(TYPES)}, or give <type>/<leaf>/{rel.stem}")
+        mtype = a.type
+    elif rel.parts[0] in TYPES:
+        mtype = rel.parts[0]
+    else:
+        raise SystemExit(f"target must start with one of {', '.join(TYPES)}/, e.g. feedback/my-repo/{rel.stem}")
+    clash = [m for m in load(root) if m.name == rel.stem]
+    if clash:
+        raise SystemExit(f"name `{rel.stem}` is already used by {clash[0].path}")
+    path = root / rel
+    if path.exists():
+        raise SystemExit(f"{path} exists")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    extra = "\n\n**Why:** \n\n**How to apply:** \n" if mtype in ("feedback", "project") else "\n"
+    path.write_text(f"---\nname: {rel.stem}\ndescription: \nmetadata:\n  type: {mtype}\n"
+                    f"  title: {humanize(rel.stem)}\n---\n\n<the fact>{extra}")
+    if a.no_edit:
+        ok(f"created {rel}")
+    else:
+        editor(path)
+    after_edit(root, path)
+    return 0
+
+
+def cmd_rm(root, a):
+    memories = load(root)
+    m = resolve(root, memories, a.name)
+    inbound = [o.name for o in memories if m.name and m.name in o.links and o is not m]
+    if inbound:
+        warn(f"linked from: {', '.join(inbound)} (those [[links]] stay as markers)")
+    if not a.yes:
+        if not sys.stdin.isatty():
+            raise SystemExit("not a terminal: pass --yes to delete without asking")
+        if input(f"Delete {m.path}? [y/N] ").strip().lower() not in ("y", "yes"):
+            info("kept"); return 0
+    path = root / m.path
+    path.unlink()
+    parent = path.parent
+    while parent != root and not any(p for p in parent.iterdir() if p.name != ".DS_Store"):
+        for junk in parent.iterdir():
+            junk.unlink()
+        parent.rmdir(); parent = parent.parent
+    ok(f"deleted {m.path}")
+    write_index(root, load(root))
+    return 0
+
+
+def cmd_mv(root, a):
+    memories = load(root)
+    m = resolve(root, memories, a.name)
+    dest = a.folder.strip("/")
+    mtype, _, folder = dest.partition("/")
+    moves, errors = plan_moves(root, memories, [(m.path.as_posix(), mtype, folder, a.rename or m.name)])
+    for e in errors:
+        err(e)
+    if errors:
+        return 1
+    if mtype != m.mtype and not a.retype:
+        err(f"{m.path} has type `{m.mtype}`; moving it under {mtype}/ changes that, pass --retype to confirm")
+        return 1
+    if not apply_moves(root, moves, a.dry_run):
+        info("nothing to do")
+    return 0
+
+
+def cmd_migrate(root, a):
+    memories = load(root)
+    if a.apply:
+        rows = read_plan(Path(a.apply).read_text())
+        moves, errors = plan_moves(root, memories, rows)
+        for e in errors:
+            err(e)
+        if errors:
+            err(f"nothing moved: fix the {len(errors)} problem(s) in {a.apply}")
+            return 1
+        moved = apply_moves(root, moves, a.dry_run)
+        (info if a.dry_run else ok)(f"{moved} memories {'would move' if a.dry_run else 'moved'}"
+                                     + ("" if a.dry_run else " — run: memory check"))
+        return 0
+    flat = [m for m in memories if m.flat]
+    if not flat:
+        info("no flat memories: everything is in type folders already")
+        return 0
+    out = [PLAN_HEADER.rstrip("\n")]
+    for m in flat:
+        if not m.has_frontmatter:
+            out.append(f"# {m.path}: no frontmatter, fix it and plan again")
+            continue
+        out.append("\t".join([m.path.as_posix(), m.mtype if m.mtype in TYPES else "?", "",
+                              slugify(m.name or m.path.stem, m.mtype)]))
+    print("\n".join(out))
+    return 0
+
+
+def cmd_index(root, a):
+    memories = load(root)
+    if a.dry_run:
+        new, old = build_index(root, memories)
+        diff = list(difflib.unified_diff(old.splitlines(), new.splitlines(), INDEX, INDEX + " (new)", lineterm=""))
+        print("\n".join(diff) if diff else f"{INDEX} is up to date")
+        return 1 if diff else 0
+    write_index(root, memories)
+    return 0
+
+
+def cmd_check(root, a):
+    memories = load(root)
+    errors, warnings = problems(root, memories)
+    for e in errors:
+        err(e)
+    for w in warnings:
+        warn(w)
+    summary = f"{count(memories)} memories, {len(errors)} error(s), {len(warnings)} warning(s)"
+    (ok if not errors else err)(summary)
+    return 1 if errors else 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="memory", description=__doc__.split("\n\n")[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     epilog="\n\n".join(__doc__.split("\n\n")[1:]))
+    parser.add_argument("--root", help="memory tree (default $MEMORY_ROOT, else ~/.claude/memory)")
+    sub = parser.add_subparsers(dest="cmd")
+    p = sub.add_parser("ls", help="list memories (fzf picker in a terminal)")
+    p.add_argument("query", nargs="?")
+    p.add_argument("--plain", action="store_true", help="plain list even in a terminal")
+    for name, text in (("show", "print a memory"), ("path", "print its path"), ("edit", "edit in $EDITOR")):
+        sub.add_parser(name, help=text).add_argument("name")
+    p = sub.add_parser("new", help="create a memory: <type>[/<leaf>...]/<slug>, or <slug> --type T (flat)")
+    p.add_argument("target")
+    p.add_argument("--type", choices=TYPES, help="type of a flat memory (file directly in the root)")
+    p.add_argument("--no-edit", action="store_true", help="create the file without opening the editor")
+    p = sub.add_parser("rm", help="delete a memory")
+    p.add_argument("name")
+    p.add_argument("--yes", action="store_true", help="do not ask")
+    p = sub.add_parser("mv", help="move (and rename) a memory, rewrite links to it, rebuild the index")
+    p.add_argument("name")
+    p.add_argument("folder", help="<type>[/<folder>...], e.g. project/fritz-monitoring")
+    p.add_argument("--name", dest="rename", help="new name (kebab-case); [[links]] are rewritten")
+    p.add_argument("--retype", action="store_true", help="allow a move into another type folder")
+    p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("migrate", help="flat → tree: --plan prints a plan to edit, --apply runs it")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--plan", action="store_true", help="print a tab-separated plan for every flat memory")
+    g.add_argument("--apply", metavar="PLAN", help="check the whole plan, then move, rename, relink, reindex")
+    p.add_argument("--dry-run", action="store_true", help="with --apply: show what would happen")
+    p = sub.add_parser("index", help="rebuild MEMORY.md")
+    p.add_argument("--dry-run", action="store_true", help="print the diff, exit 1 if it would change")
+    sub.add_parser("check", help="report problems; exit 1 on errors")
+    p = sub.add_parser("status", help="one short line for a status line (cached until the tree changes)")
+    p.add_argument("--color", action="store_true", help="ANSI colors: green ok, yellow near a limit, red errors")
+    p = sub.add_parser("hook", help="Claude Code hook: post-tool-use rebuilds the index, session-start reports")
+    p.add_argument("event", choices=["post-tool-use", "session-start"])
+    a = parser.parse_args(argv)
+    root = root_dir(a.root)
+    if not a.cmd:
+        parser.print_help(); return 0
+    if not root.is_dir():
+        if a.cmd in ("status", "hook"):   # no memory folder on this machine: say nothing, block nothing
+            return 0
+        raise SystemExit(f"no memory tree at {root}")
+    return {"ls": cmd_ls, "show": cmd_show, "path": cmd_path, "edit": cmd_edit, "new": cmd_new,
+            "rm": cmd_rm, "mv": cmd_mv, "migrate": cmd_migrate, "index": cmd_index, "check": cmd_check, "status": cmd_status,
+            "hook": cmd_hook}[a.cmd](root, a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
